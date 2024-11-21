@@ -1,0 +1,328 @@
+---
+title: "Intro to Modeling (Continued fot HW9)"
+format: html
+editor: visual
+---
+
+```{r}
+library(readr)
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(tidyr)
+library(ggplot2)
+library(ggcorrplot)
+library(tidymodels)
+library(rpart.plot)
+library(vip)
+
+bike_raw <-  read_csv(
+  "./Data/SeoulBikeData.csv",
+  col_names = TRUE,
+  locale = locale(encoding = 'latin1')
+)
+```
+
+## EDA
+
+```{r}
+bike_raw |> 
+  summarise(across(everything(), ~sum(is.na(.))))
+```
+
+We observe no missing values.
+
+```{r}
+str(bike_raw)
+```
+
+We see the types generally make sense, so we'll only convert the date column (and create factors from the string variables) but rename all with a short function.
+
+```{r}
+format_column_name <- function(name) {
+  name |> 
+    str_remove_all("[^[:alnum:] ]")  |>
+    str_squish() |> 
+    str_to_lower() |> 
+    str_replace_all(" ", "_") |> 
+    str_replace_all("temperaturec", "temperature_c")
+}
+
+bike_tbl <-  bike_raw |> 
+  rename_with(format_column_name) |> 
+  mutate(date = dmy(date)) |> 
+  mutate(across(where(is.character), as.factor))
+
+bike_tbl |>
+  summarize(across(where(is.numeric), list("mean" = mean, "sd" = sd), .names = "{.fn}_{.col}"))
+
+bike_tbl |>
+  group_by(seasons, holiday, functioning_day) |> 
+  summarize(across(where(is.numeric), list("mean" = mean, "sd" = sd), .names = "{.fn}_{.col}"))
+
+table(bike_tbl$seasons)
+table(bike_tbl$holiday)
+table(bike_tbl$functioning_day)
+```
+
+We can get a sense of trends by group, in particular that non-functioning days will have 0 rentals.
+
+```{r}
+bike_tbl <- bike_tbl |> 
+  filter(functioning_day == "Yes") |> 
+  select(-functioning_day)
+```
+
+Now we want to only have one observation per day and use the daily average or sum of certain statistics.
+
+```{r}
+bike_tbl <- bike_tbl |> 
+  group_by(date, seasons, holiday) |> 
+  mutate(across(c(rented_bike_count, rainfallmm, snowfall_cm), list("sum" = sum), .names = "{.col}")) |> 
+  mutate(across(c(temperature_c, humidity, wind_speed_ms, visibility_10m, dew_point_temperature_c, solar_radiation_mjm2), list("mean" = mean), .names = "{.col}")) |> 
+  filter(row_number()==1) |> 
+  select(-hour)
+```
+
+Now we summarize again, with a few plots for good measure.
+
+```{r}
+bike_tbl |>
+  ungroup() |> 
+  summarize(across(where(is.numeric), list("mean" = mean, "sd" = sd), .names = "{.fn}_{.col}"))
+
+bike_tbl |>
+  group_by(seasons, holiday) |> 
+  summarize(across(where(is.numeric), list("mean" = mean, "sd" = sd), .names = "{.fn}_{.col}"))
+
+bike_tbl |> 
+  ungroup() |> 
+  select(where(is.numeric)) |> 
+  cor() |>
+  ggcorrplot(hc.order = TRUE, type = "lower", lab = TRUE)
+
+bike_tbl |> 
+  ggplot(aes(x = rented_bike_count)) +
+  geom_histogram()
+
+bike_tbl |> 
+  ggplot(aes(x = rented_bike_count, fill = holiday)) +
+  facet_wrap("seasons") +
+  geom_histogram()
+
+bike_tbl |> 
+  ggplot() +
+  geom_point(aes(x = temperature_c, y = rented_bike_count))
+
+bike_tbl |> 
+  ggplot() +
+  geom_line(aes(x = date, y = rented_bike_count))
+```
+
+We see a few trends:
+
+-   Weather appears to impact rentals (with more summery weather correlated positively with rentals), but could also be correlated with season.
+
+-   Winter almost creates a "secondary mode" in the rental histogram since it has so many low-rental days.
+
+-   Holidays don't seem to increase bike rentals, but also don't obviously decrease them.
+
+## Modeling
+
+First we'll split up our data as desired.
+
+```{r}
+set.seed(123456)
+bike_split <- initial_split(bike_tbl, strata = seasons)
+
+bike_cv_folds <- vfold_cv(training(bike_split), 10)
+```
+
+Now we build recipes.
+
+```{r}
+recipe_1 <- recipe(rented_bike_count ~ ., data = training(bike_split)) |> 
+  step_mutate(day_type = factor(ifelse(wday(date, label = TRUE) %in% c("Sat", "Sun"), "Weekend", "Weekday"))) |> 
+  step_normalize(where(is.numeric)) |> 
+  step_dummy(c("seasons", "holiday", "day_type")) |> 
+  step_rm(date)
+
+wf_1 <- workflow() |> 
+  add_recipe(recipe_1) |> 
+  add_model(linear_reg() |> set_engine("lm"))
+
+wf_1 |> 
+  fit_resamples(bike_cv_folds) |> 
+  collect_metrics()
+
+recipe_2 <- recipe(rented_bike_count ~ ., data = training(bike_split)) |> 
+  step_mutate(day_type = factor(ifelse(wday(date, label = TRUE) %in% c("Sat", "Sun"), "Weekend", "Weekday"))) |> 
+  step_normalize(where(is.numeric)) |> 
+  step_dummy(seasons, holiday, day_type) |> 
+  step_interact(terms = ~ starts_with("holiday"):starts_with("seasons")) |> 
+  step_interact(terms = ~ starts_with("seasons"):temperature_c) |> 
+  step_interact(terms = ~ temperature_c:rainfallmm) |> 
+  step_rm(date)
+
+wf_2 <- workflow() |> 
+  add_recipe(recipe_2) |> 
+  add_model(linear_reg() |> set_engine("lm"))
+
+wf_2 |> 
+  fit_resamples(bike_cv_folds) |> 
+  collect_metrics()
+
+recipe_3 <- recipe(rented_bike_count ~ ., data = training(bike_split)) |> 
+  step_mutate(day_type = factor(ifelse(wday(date, label = TRUE) %in% c("Sat", "Sun"), "Weekend", "Weekday"))) |> 
+  step_mutate(across(where(is.numeric), ~ .x^2, .names = "{.col}_quad")) |> 
+  step_normalize(where(is.numeric) & !ends_with("_quad")) |> 
+  step_dummy(seasons, holiday, day_type) |> 
+  step_interact(terms = ~ starts_with("holiday"):starts_with("seasons")) |> 
+  step_interact(terms = ~ starts_with("seasons"):temperature_c) |> 
+  step_interact(terms = ~ temperature_c:rainfallmm) |> 
+  step_rm(date)
+
+wf_3 <- workflow() |> 
+  add_recipe(recipe_3) |> 
+  add_model(linear_reg() |> set_engine("lm"))
+
+wf_3 |> 
+  fit_resamples(bike_cv_folds) |> 
+  collect_metrics()
+```
+
+It looks like our error is minimized in model 3, so we'll use that for the last part.
+
+```{r}
+test_run <- wf_3 |> 
+  last_fit(bike_split, metrics = metric_set(rmse, mae))
+
+test_run |> 
+  collect_metrics()
+test_run |> 
+  extract_fit_parsnip() |> 
+  tidy()
+```
+
+It looks like that model does pretty well here. Our coefficients are interesting too, to see which variables are used heavily in the model.
+
+# HW9 Portion
+
+## LASSO
+
+```{r}
+lasso_setup <- linear_reg(penalty = tune(), mixture = 1) |> 
+  set_engine("glmnet")
+
+lasso_wf <- workflow() |> 
+  add_recipe(recipe_1) |> 
+  add_model(lasso_setup) 
+
+lasso_best_model <- lasso_wf |> 
+  tune_grid(resamples = bike_cv_folds, grid = grid_regular(penalty(), levels = 200)) |>
+  select_best(metric = "rmse")
+
+lasso_wf |> 
+  finalize_workflow(lasso_best_model) |>
+  last_fit(bike_split, metrics = metric_set(rmse, mae)) |> 
+  collect_metrics()
+
+lasso_wf |> 
+  finalize_workflow(lasso_best_model) |>
+  last_fit(bike_split) |> 
+  extract_fit_parsnip() |> 
+  tidy()
+```
+
+## Regression tree
+
+```{r}
+tree_setup <- decision_tree(tree_depth = tune(), min_n = tune(), cost_complexity = tune()) |>
+  set_engine("rpart") |>
+  set_mode("regression")
+
+tree_wf <- workflow() |> 
+  add_recipe(recipe_1) |> 
+  add_model(tree_setup)
+
+tree_best_model <- tree_wf |> 
+  tune_grid(resamples = bike_cv_folds) |> 
+  select_best(metric = "rmse")
+  
+tree_wf |> 
+  finalize_workflow(tree_best_model) |> 
+  last_fit(bike_split, metrics = metric_set(rmse, mae)) |> 
+  collect_metrics()
+
+tree_wf |> 
+  finalize_workflow(tree_best_model) |> 
+  last_fit(bike_split) |> 
+  extract_fit_engine() |> 
+  rpart.plot(roundint = FALSE)
+```
+
+## Bagged tree
+
+```{r}
+bag_setup <- bag_tree(tree_depth = tune(), min_n = tune(), cost_complexity = tune()) |>
+  set_engine("rpart", importance = "impurity") |>
+  set_mode("regression")
+
+bag_wf <- workflow() |> 
+  add_recipe(recipe_1) |> 
+  add_model(tree_setup)
+
+bag_best_model <- bag_wf |> 
+  tune_grid(resamples = bike_cv_folds) |> 
+  select_best(metric = "rmse")
+
+bag_wf |> 
+  finalize_workflow(bag_best_model) |> 
+  last_fit(bike_split, metrics = metric_set(rmse, mae)) |> 
+  collect_metrics()
+
+bag_wf |> 
+  finalize_workflow(bag_best_model) |> 
+  last_fit(bike_split) |> 
+  extract_fit_engine() |>
+  vip(geom = "col")
+```
+
+## Random forest
+
+```{r}
+forest_setup <- rand_forest(mtry = tune()) |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("regression")
+
+forest_wf <- workflow() |> 
+  add_recipe(recipe_1) |> 
+  add_model(forest_setup)
+
+forest_best_model <- forest_wf |> 
+  tune_grid(resamples = bike_cv_folds) |> 
+  select_best(metric = "rmse")
+
+forest_wf |> 
+  finalize_workflow(forest_best_model) |> 
+  last_fit(bike_split, metrics = metric_set(rmse, mae)) |> 
+  collect_metrics()
+
+forest_wf |> 
+  finalize_workflow(forest_best_model) |> 
+  last_fit(bike_split) |> 
+  extract_fit_engine() |>
+  vip(geom = "col")
+```
+
+## Best model
+
+Our best model with lowest RMSE (using recipe 1) is the random forest. Here is the full fit.
+
+```{r, error=TRUE}
+forest_wf |> 
+  fit(bike_tbl) |> 
+  extract_fit_engine() |>
+  vip(geom = "col") 
+```
+
